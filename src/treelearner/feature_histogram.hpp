@@ -714,6 +714,82 @@ class FeatureHistogram {
   }
 
   template <bool USE_L1, bool USE_MAX_OUTPUT, bool USE_SMOOTHING>
+  // ============================================================================
+  // CalculateSplittedLeafOutput：リーフの最適な出力値を計算
+  // ============================================================================
+  // 
+  // 【なぜ2次テイラー展開が必要なのか？】
+  // 
+  // 1次テイラー展開では最適解が求まりません！
+  // 
+  // 【1次テイラー展開の場合】
+  //   L(w) ≈ L(0) + g_i * w
+  // 
+  //   これは線形関数なので：
+  //   - g_i < 0 の場合：wを大きくすると損失が減り続ける → w = +∞ が最適（発散）
+  //   - g_i > 0 の場合：wを小さくすると損失が減り続ける → w = -∞ が最適（発散）
+  //   - g_i = 0 の場合：wの値に関係なく損失は一定
+  // 
+  //   つまり、1次テイラー展開では最適なwが存在しません（または無限大に発散）。
+  // 
+  // 【2次テイラー展開の場合】
+  //   L(w) ≈ L(0) + g_i * w + (1/2) * h_i * w^2
+  // 
+  //   これは2次関数（放物線）なので：
+  //   - h_i > 0 の場合：下に凸の放物線 → 最小値が存在する
+  //   - h_i < 0 の場合：上に凸の放物線 → 最大値が存在する（最小値は発散）
+  // 
+  //   通常、損失関数は凸関数（h_i > 0）なので、最小値が存在します。
+  // 
+  // 【数学的な導出】
+  // 
+  // リーフに含まれるサンプルiについて、損失関数を2次テイラー展開で近似：
+  //   L(w) ≈ L(0) + g_i * w + (1/2) * h_i * w^2
+  // 
+  // ここで：
+  //   - g_i = 勾配（gradient）：損失関数の1次導関数
+  //   - h_i = ヘッシアン（hessian）：損失関数の2次導関数（通常 > 0）
+  //   - w = リーフの出力値（このリーフに該当するサンプルの予測値をどれだけ増やすか）
+  // 
+  // 【出力値（output value）とは？】
+  // 
+  // 出力値は、決定木のリーフが予測する値です。
+  // MAPEなどの目的変数（正解ラベル）ではなく、予測値そのものです。
+  // 
+  // 勾配ブースティングの予測の流れ：
+  //   1. 初期予測値から開始（例：平均値、または0）
+  //   2. 各ツリーのリーフの出力値を累積：score += learning_rate * tree_output
+  //   3. 最終的な予測値 = 初期予測値 + すべてのツリーの出力値の合計
+  // 
+  // 例：回帰タスクの場合
+  //   - 初期予測値 = 10.0（平均値）
+  //   - ツリー1のリーフの出力値 = +2.5
+  //   - ツリー2のリーフの出力値 = -1.3
+  //   - ツリー3のリーフの出力値 = +0.8
+  //   - 最終予測値 = 10.0 + 0.1*(2.5 - 1.3 + 0.8) = 10.2（learning_rate=0.1の場合）
+  // 
+  // つまり、出力値は「現在の予測値をどれだけ修正するか」を表す値です。
+  // 
+  // リーフに含まれるすべてのサンプルの損失の合計は：
+  //   Σ L(w) ≈ Σ L(0) + (Σ g_i) * w + (1/2) * (Σ h_i) * w^2
+  //          = 定数 + sum_gradients * w + (1/2) * sum_hessians * w^2
+  // 
+  // L2正則化項を追加すると：
+  //   Σ L(w) + (1/2) * lambda_l2 * w^2
+  //     = 定数 + sum_gradients * w + (1/2) * (sum_hessians + lambda_l2) * w^2
+  // 
+  // この式をwについて最小化するには、wで微分して0とおきます：
+  //   d/dw [sum_gradients * w + (1/2) * (sum_hessians + lambda_l2) * w^2] = 0
+  //   sum_gradients + (sum_hessians + lambda_l2) * w = 0
+  // 
+  // したがって、最適な出力値は：
+  //   w* = -sum_gradients / (sum_hessians + lambda_l2)
+  // 
+  // 【まとめ】
+  //   - 1次テイラー展開：線形関数 → 最適解が存在しない（発散）
+  //   - 2次テイラー展開：2次関数（放物線）→ 最小値が存在する → 最適解が求まる
+  // 
+  // これが、なぜ2次テイラー展開が必要なのかの理由です！
   static double CalculateSplittedLeafOutput(double sum_gradients,
                                             double sum_hessians, double l1,
                                             double l2, double max_delta_step,
@@ -721,8 +797,10 @@ class FeatureHistogram {
                                             double parent_output) {
     double ret;
     if (USE_L1) {
+      // L1正則化を使用する場合、勾配を閾値処理
       ret = -ThresholdL1(sum_gradients, l1) / (sum_hessians + l2);
     } else {
+      // L1正則化なしの場合：最適な出力値 = -勾配の合計 / (ヘッシアンの合計 + L2正則化項)
       ret = -sum_gradients / (sum_hessians + l2);
     }
     if (USE_MAX_OUTPUT) {
@@ -756,6 +834,15 @@ class FeatureHistogram {
 
  private:
   template <bool USE_MC, bool USE_L1, bool USE_MAX_OUTPUT, bool USE_SMOOTHING>
+  // ============================================================================
+  // GetSplitGains：分割によるゲイン（損失の減少量）を計算
+  // ============================================================================
+  // ゲイン = 左リーフのゲイン + 右リーフのゲイン
+  // 
+  // 数学的には：
+  //   ゲイン = 分割前の損失 - (分割後の左リーフの損失 + 分割後の右リーフの損失)
+  // 
+  // ゲインが大きい = 分割することで損失が大きく減る = 良い分割
   static double GetSplitGains(double sum_left_gradients,
                               double sum_left_hessians,
                               double sum_right_gradients,
@@ -768,6 +855,7 @@ class FeatureHistogram {
                               data_size_t right_count,
                               double parent_output) {
     if (!USE_MC) {
+      // モノトーン制約がない場合：左リーフのゲイン + 右リーフのゲイン
       return GetLeafGain<USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING>(sum_left_gradients,
                                                                 sum_left_hessians, l1, l2,
                                                                 max_delta_step, smoothing,
@@ -796,15 +884,38 @@ class FeatureHistogram {
     }
   }
 
+  // ============================================================================
+  // GetLeafGain：リーフのゲイン（損失の減少量）を計算
+  // ============================================================================
+  // 
+  // 【数学的な導出】
+  // 
+  // 最適な出力値 output* = -sum_gradients / (sum_hessians + lambda_l2) を使った場合の
+  // ゲイン（損失の減少量）を計算します。
+  // 
+  // GetLeafGainGivenOutput()の説明で示したように、最適な出力値を使うと：
+  //   gain = sum_gradients^2 / (sum_hessians + lambda_l2)
+  // 
+  // この式の意味：
+  //   - 勾配が大きい（sum_gradientsが大きい）→ ゲインが大きい → 損失を大きく減らせる
+  //   - ヘッシアンが大きい（sum_hessiansが大きい）→ ゲインが小さい → 損失の曲率が大きい
+  //   - L2正則化項が大きい（lambda_l2が大きい）→ ゲインが小さい → 過学習を防ぐ
+  // 
+  // この公式は、最適な出力値を使った場合の損失の減少量を直接計算する高速な方法です。
   template <bool USE_L1, bool USE_MAX_OUTPUT, bool USE_SMOOTHING>
   static double GetLeafGain(double sum_gradients, double sum_hessians,
                             double l1, double l2, double max_delta_step,
                             double smoothing, data_size_t num_data, double parent_output) {
     if (!USE_MAX_OUTPUT && !USE_SMOOTHING) {
+      // シンプルな場合：ゲイン = (勾配の2乗) / (ヘッシアン + L2正則化項)
+      // これは、最適な出力値を使った場合の損失の減少量を直接計算する公式です
       if (USE_L1) {
+        // L1正則化を使用する場合、勾配を閾値処理
         const double sg_l1 = ThresholdL1(sum_gradients, l1);
         return (sg_l1 * sg_l1) / (sum_hessians + l2);
       } else {
+        // L1正則化なしの場合
+        // ゲイン = (勾配の合計)^2 / (ヘッシアンの合計 + L2正則化項)
         return (sum_gradients * sum_gradients) / (sum_hessians + l2);
       }
     } else {
@@ -814,14 +925,48 @@ class FeatureHistogram {
     }
   }
 
+  // ============================================================================
+  // GetLeafGainGivenOutput：リーフの出力値が決まっている場合のゲインを計算
+  // ============================================================================
+  // 
+  // 【数学的な導出】
+  // 
+  // ゲイン（損失の減少量）は、出力値0の場合とoutputの場合の損失の差です：
+  // 
+  //   gain = L(0) - L(output)
+  // 
+  // 2次テイラー展開を使うと：
+  //   L(0) = 定数（出力値0の場合の損失）
+  //   L(output) ≈ 定数 + sum_gradients * output + (1/2) * (sum_hessians + l2) * output^2
+  // 
+  // したがって：
+  //   gain = L(0) - L(output)
+  //        = -[sum_gradients * output + (1/2) * (sum_hessians + l2) * output^2]
+  //        = -(sum_gradients * output + (1/2) * (sum_hessians + l2) * output^2)
+  // 
+  // コードでは、係数1/2を省略して2倍しています（比較のため、定数倍は問題ない）：
+  //   gain = -(2 * sum_gradients * output + (sum_hessians + l2) * output^2)
+  // 
+  // 最適な出力値 output* = -sum_gradients / (sum_hessians + l2) を代入すると：
+  //   gain = -(2 * sum_gradients * output* + (sum_hessians + l2) * (output*)^2)
+  //        = -(2 * sum_gradients * (-sum_gradients/(sum_hessians+l2)) 
+  //            + (sum_hessians + l2) * (sum_gradients/(sum_hessians+l2))^2)
+  //        = -(-2 * sum_gradients^2/(sum_hessians+l2) + sum_gradients^2/(sum_hessians+l2))
+  //        = sum_gradients^2 / (sum_hessians + l2)
+  // 
+  // これが、GetLeafGain()のシンプルな公式の由来です！
   template <bool USE_L1>
   static double GetLeafGainGivenOutput(double sum_gradients,
                                        double sum_hessians, double l1,
                                        double l2, double output) {
     if (USE_L1) {
       const double sg_l1 = ThresholdL1(sum_gradients, l1);
+      // L1正則化を使用する場合
       return -(2.0 * sg_l1 * output + (sum_hessians + l2) * output * output);
     } else {
+      // L1正則化なしの場合
+      // ゲイン = -(2 * 勾配の合計 * 出力値 + (ヘッシアンの合計 + L2) * 出力値^2)
+      // これは、出力値0の場合とoutputの場合の損失の差を表します
       return -(2.0 * sum_gradients * output +
                (sum_hessians + l2) * output * output);
     }
@@ -859,50 +1004,71 @@ class FeatureHistogram {
       int t = meta_->num_bin - 1 - offset - NA_AS_MISSING;
       const int t_end = 1 - offset;
 
-      // from right to left, and we don't need data in bin0
+      // 【ビン分割の探索】右から左へ、各ビンの境界で分割を試す
+      // 注意：分割方式を「切り替えている」のではなく、各ビンで分割を「試している」
+      // つまり、ビン0と1の間、ビン1と2の間、...、ビン254と255の間で分割を試し、
+      // それぞれのゲインを計算して、最大ゲインの分割点を選ぶ
       for (; t >= t_end; --t) {
-        // need to skip default bin
+        // デフォルトビン（欠損値用）をスキップ
         if (SKIP_DEFAULT_BIN) {
           if ((t + offset) == static_cast<int>(meta_->default_bin)) {
             continue;
           }
         }
+        
+        // 【ステップ1】現在のビンtの勾配とヘッシアンを取得
+        // ヒストグラムから、ビンtに含まれるサンプルの勾配とヘッシアンの合計を取得
         const auto grad = GET_GRAD(data_, t);
         const auto hess = GET_HESS(data_, t);
         data_size_t cnt =
             static_cast<data_size_t>(Common::RoundInt(hess * cnt_factor));
+        
+        // 【ステップ2】右側（ビンt以降）の勾配とヘッシアンの合計を累積
+        // ビンtで分割した場合、右側にはビンt, t+1, ..., 255が含まれる
         sum_right_gradient += grad;
         sum_right_hessian += hess;
         right_count += cnt;
-        // if data not enough, or sum hessian too small
+        
+        // 【ステップ3】分割の制約をチェック
+        // 右側に十分なデータがない、またはヘッシアンが小さすぎる場合はスキップ
         if (right_count < meta_->config->min_data_in_leaf ||
             sum_right_hessian < meta_->config->min_sum_hessian_in_leaf) {
           continue;
         }
+        
+        // 【ステップ4】左側（ビン0からt-1まで）のデータ数を計算
         data_size_t left_count = num_data - right_count;
-        // if data not enough
         if (left_count < meta_->config->min_data_in_leaf) {
-          break;
+          break;  // 左側に十分なデータがない場合、これ以上試す必要がない
         }
 
+        // 【ステップ5】左側の勾配とヘッシアンの合計を計算
+        // 親ノードの合計から右側の合計を引くことで計算（高速化）
         double sum_left_hessian = sum_hessian - sum_right_hessian;
-        // if sum hessian too small
         if (sum_left_hessian < meta_->config->min_sum_hessian_in_leaf) {
-          break;
+          break;  // 左側のヘッシアンが小さすぎる場合、これ以上試す必要がない
         }
-
         double sum_left_gradient = sum_gradient - sum_right_gradient;
+        
+        // 【ステップ6】ランダム分割の場合、指定されたビンでのみ分割を試す
         if (USE_RAND) {
           if (t - 1 + offset != rand_threshold) {
             continue;
           }
         }
 
+        // 【ステップ7】モノトーン制約を更新（必要に応じて）
         if (USE_MC && constraint_update_necessary) {
           constraints->Update(t + offset);
         }
 
-        // current split gain
+        // 【ステップ8】このビンで分割した場合のゲインを計算
+        // GetSplitGains()の中で以下が実行されます：
+        //   1. 左リーフの最適な出力値を計算: left_output = -sum_left_gradient / (sum_left_hessian + l2)
+        //   2. 右リーフの最適な出力値を計算: right_output = -sum_right_gradient / (sum_right_hessian + l2)
+        //   3. 左リーフのゲインを計算: left_gain = -(2*sum_left_gradient*left_output + (sum_left_hessian+l2)*left_output^2)
+        //   4. 右リーフのゲインを計算: right_gain = -(2*sum_right_gradient*right_output + (sum_right_hessian+l2)*right_output^2)
+        //   5. 分割によるゲイン = left_gain + right_gain
         double current_gain = GetSplitGains<USE_MC, USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING>(
             sum_left_gradient, sum_left_hessian, sum_right_gradient,
             sum_right_hessian, meta_->config->lambda_l1,

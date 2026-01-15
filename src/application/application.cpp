@@ -31,14 +31,22 @@
 
 namespace LightGBM {
 
+// ============================================================================
+// Applicationコンストラクタ：初期化処理
+// ============================================================================
 Application::Application(int argc, char** argv) {
+  // 【ステップ1】コマンドライン引数からパラメータを読み込む
   LoadParameters(argc, argv);
-  // set number of threads for openmp
+  
+  // 【ステップ2】OpenMPのスレッド数を設定（並列処理のための設定）
   OMP_SET_NUM_THREADS(config_.num_threads);
+  
+  // 【ステップ3】データファイルが指定されているかチェック
   if (config_.data.size() == 0 && config_.task != TaskType::kConvertModel) {
     Log::Fatal("No training/prediction data, application quit");
   }
 
+  // 【ステップ4】GPU（CUDA）を使用する場合の設定
   if (config_.device_type == std::string("cuda")) {
       LGBM_config_::current_device = lgbm_device_cuda;
   }
@@ -50,26 +58,33 @@ Application::~Application() {
   }
 }
 
+// ============================================================================
+// LoadParameters：コマンドライン引数と設定ファイルからパラメータを読み込む
+// ============================================================================
 void Application::LoadParameters(int argc, char** argv) {
   std::unordered_map<std::string, std::vector<std::string>> all_params;
   std::unordered_map<std::string, std::string> params;
+  
+  // 【ステップ1】コマンドライン引数を解析してパラメータマップに追加
+  // 例: "objective=regression" → {"objective": ["regression"]}
   for (int i = 1; i < argc; ++i) {
     Config::KV2Map(&all_params, argv[i]);
   }
-  // read parameters from config file
+  
+  // 【ステップ2】設定ファイルからパラメータを読み込む（configオプションが指定されている場合）
   bool config_file_ok = true;
   if (all_params.count("config") > 0) {
     TextReader<size_t> config_reader(all_params["config"][0].c_str(), false);
     config_reader.ReadAllLines();
     if (!config_reader.Lines().empty()) {
       for (auto& line : config_reader.Lines()) {
-        // remove str after "#"
+        // "#"以降のコメントを削除
         if (line.size() > 0 && std::string::npos != line.find_first_of("#")) {
           line.erase(line.find_first_of("#"));
         }
-        line = Common::Trim(line);
+        line = Common::Trim(line);  // 前後の空白を削除
         if (line.size() == 0) {
-          continue;
+          continue;  // 空行はスキップ
         }
         Config::KV2Map(&all_params, line.c_str());
       }
@@ -77,50 +92,67 @@ void Application::LoadParameters(int argc, char** argv) {
       config_file_ok = false;
     }
   }
+  
+  // 【ステップ3】ログの詳細度を設定
   Config::SetVerbosity(all_params);
-  // de-duplicate params
+  
+  // 【ステップ4】重複パラメータを削除（最初の値のみを保持）
   Config::KeepFirstValues(all_params, &params);
+  
   if (!config_file_ok) {
     Log::Warning("Config file %s doesn't exist, will ignore", params["config"].c_str());
   }
+  
+  // 【ステップ5】パラメータのエイリアスを変換（例: "num_iterations" → "num_iteration"）
   ParameterAlias::KeyAliasTransform(&params);
+  
+  // 【ステップ6】設定オブジェクトにパラメータを設定
   config_.Set(params);
   Log::Info("Finished loading parameters");
 }
 
+// ============================================================================
+// LoadData：訓練データと検証データを読み込む
+// ============================================================================
 void Application::LoadData() {
   auto start_time = std::chrono::high_resolution_clock::now();
   std::unique_ptr<Predictor> predictor;
-  // prediction is needed if using input initial model(continued train)
+  
+  // 【ステップ1】継続訓練の場合、既存モデルから予測関数を取得
+  // （初期モデルから予測値を計算して、それを初期スコアとして使用するため）
   PredictFunction predict_fun = nullptr;
-  // need to continue training
   if (boosting_->NumberOfTotalModel() > 0 && config_.task != TaskType::KRefitTree) {
     predictor.reset(new Predictor(boosting_.get(), 0, -1, true, false, false, false, -1, -1));
     predict_fun = predictor->GetPredictFunction();
   }
 
-  // sync up random seed for data partition
+  // 【ステップ2】分散学習の場合、ランダムシードを同期
   if (config_.is_data_based_parallel) {
     config_.data_random_seed = Network::GlobalSyncUpByMin(config_.data_random_seed);
   }
 
+  // 【ステップ3】データセットローダーを作成
   Log::Debug("Loading train file...");
   DatasetLoader dataset_loader(config_, predict_fun,
                                config_.num_class, config_.data.c_str());
-  // load Training data
+  
+  // 【ステップ4】訓練データを読み込む
   if (config_.is_data_based_parallel) {
-    // load data for distributed training
+    // 分散学習の場合：各マシンが自分の担当分のデータを読み込む
     train_data_.reset(dataset_loader.LoadFromFile(config_.data.c_str(),
                                                   Network::rank(), Network::num_machines()));
   } else {
-    // load data for single machine
+    // 単一マシンの場合：全データを読み込む
     train_data_.reset(dataset_loader.LoadFromFile(config_.data.c_str(), 0, 1));
   }
-  // need save binary file
+  
+  // 【ステップ5】バイナリファイルとして保存する場合
   if (config_.save_binary) {
     train_data_->SaveBinaryFile(nullptr);
   }
-  // create training metric
+  
+  // 【ステップ6】訓練データ用の評価指標を作成
+  // 例: "rmse", "auc", "multi_logloss" など
   if (config_.is_provide_training_metric) {
     for (auto metric_type : config_.metric) {
       auto metric = std::unique_ptr<Metric>(Metric::CreateMetric(metric_type, config_));
@@ -172,11 +204,15 @@ void Application::LoadData() {
             std::chrono::duration<double, std::milli>(end_time - start_time) * 1e-3);
 }
 
+// ============================================================================
+// InitTrain：訓練前の初期化処理
+// ============================================================================
 void Application::InitTrain() {
+  // 【ステップ1】分散学習の場合、ネットワークを初期化
   if (config_.is_parallel) {
-    // need init network
     Network::Init(config_);
     Log::Info("Finished initializing network");
+    // 分散学習で使用するランダムシードを同期
     config_.feature_fraction_seed =
       Network::GlobalSyncUpByMin(config_.feature_fraction_seed);
     config_.feature_fraction =
@@ -185,26 +221,36 @@ void Application::InitTrain() {
       Network::GlobalSyncUpByMin(config_.drop_seed);
   }
 
-  // create boosting
+  // 【ステップ2】ブースティングオブジェクトを作成
+  // "gbdt", "dart", "goss", "rf" などのタイプを指定可能
   boosting_.reset(
     Boosting::CreateBoosting(config_.boosting,
                              config_.input_model.c_str()));
-  // create objective function
+  
+  // 【ステップ3】目的関数を作成
+  // "regression", "binary", "multiclass", "lambdarank" など
   objective_fun_.reset(
     ObjectiveFunction::CreateObjectiveFunction(config_.objective,
                                                config_));
-  // load training data
+  
+  // 【ステップ4】訓練データを読み込む
   LoadData();
+  
+  // 【ステップ5】バイナリファイル保存のみのタスクの場合は終了
   if (config_.task == TaskType::kSaveBinary) {
     Log::Info("Save data as binary finished, exit");
     exit(0);
   }
-  // initialize the objective function
+  
+  // 【ステップ6】目的関数を初期化
   objective_fun_->Init(train_data_->metadata(), train_data_->num_data());
-  // initialize the boosting
+  
+  // 【ステップ7】ブースティングオブジェクトを初期化
+  // ここで、データセット、目的関数、評価指標を設定
   boosting_->Init(&config_, train_data_.get(), objective_fun_.get(),
                   Common::ConstPtrInVectorWrapper<Metric>(train_metric_));
-  // add validation data into boosting
+  
+  // 【ステップ8】検証データをブースティングオブジェクトに追加
   for (size_t i = 0; i < valid_datas_.size(); ++i) {
     boosting_->AddValidDataset(valid_datas_[i].get(),
                                Common::ConstPtrInVectorWrapper<Metric>(valid_metrics_[i]));
@@ -213,12 +259,22 @@ void Application::InitTrain() {
   Log::Info("Finished initializing training");
 }
 
+// ============================================================================
+// Train：メインの訓練処理
+// ============================================================================
 void Application::Train() {
   Log::Info("Started training...");
+  
+  // 【ステップ1】ブースティングオブジェクトのTrain()メソッドを呼び出し
+  // この中で、指定された回数（num_iterations）だけツリーを追加していきます
+  // snapshot_freq: 定期的にモデルを保存する頻度
   boosting_->Train(config_.snapshot_freq, config_.output_model);
+  
+  // 【ステップ2】訓練が完了したら、最終的なモデルをファイルに保存
   boosting_->SaveModelToFile(0, -1, config_.saved_feature_importance_type,
                              config_.output_model.c_str());
-  // convert model to if-else statement code
+  
+  // 【ステップ3】モデルをC++のif-else文のコードに変換する場合
   if (config_.convert_model_language == std::string("cpp")) {
     boosting_->SaveModelToIfElse(-1, config_.convert_model.c_str());
   }

@@ -225,6 +225,50 @@ void GBDT::AddValidDataset(const Dataset* valid_data,
   }
 }
 
+// ============================================================================
+// Boosting：勾配とヘッシアンを計算
+// ============================================================================
+// 
+// 【勾配ブースティング（Gradient Boosting）の名前の由来】
+// 
+// 「勾配ブースティング」という名前は、2つの要素から来ています：
+// 
+// 1. 【勾配（Gradient）】
+//    - 損失関数の勾配（1次導関数）を計算して、どの方向に予測値を更新すべきかを決定
+//    - これは最急降下法（Gradient Descent）と同じ考え方です
+//    - 勾配の方向 = 損失を最も減らす方向
+// 
+// 2. 【ブースティング（Boosting）】
+//    - 複数の弱学習器（決定木）を順次追加して、前のモデルの誤差を修正
+//    - 各ツリーは、前のツリーの残差（誤差）を学習します
+//    - これにより、予測精度が段階的に向上します
+// 
+// 【最急降下法との類似性】
+// 
+// 通常の最急降下法：
+//   w_new = w_old - learning_rate * gradient
+// 
+// 勾配ブースティング：
+//   score_new = score_old + learning_rate * tree_output
+//   （tree_outputは勾配の方向に予測値を更新する）
+// 
+// つまり、勾配ブースティングは「関数空間での最急降下法」と考えることができます。
+// 
+// 【勾配ブースティングの核心：勾配とヘッシアンの計算】
+// 
+// 現在の予測値（score）と正解ラベル（label）から、損失関数の勾配とヘッシアンを計算します。
+// 
+// 例：回帰タスク（二乗誤差損失）の場合
+//   - 損失関数: L = (1/2) * (score - label)^2
+//   - 勾配（gradient）: g = dL/dscore = score - label  （損失関数の1次導関数）
+//   - ヘッシアン（hessian）: h = d²L/dscore² = 1.0      （損失関数の2次導関数）
+// 
+// 例：二値分類タスク（ロジスティック損失）の場合
+//   - 損失関数: L = log(1 + exp(-label * score))
+//   - 勾配: g = -label * sigmoid / (1 + exp(label * sigmoid * score))
+//   - ヘッシアン: h = abs(g) * (sigmoid - abs(g))
+// 
+// これらの勾配とヘッシアンを使って、次のツリーを学習します。
 void GBDT::Boosting() {
   Common::FunctionTimer fun_timer("GBDT::Boosting", global_timer);
   if (objective_function_ == nullptr) {
@@ -242,19 +286,37 @@ void GBDT::Boosting() {
   }
 }
 
+// ============================================================================
+// GBDT::Train：GBDTのメイン訓練ループ
+// ============================================================================
+// このメソッドは、指定された回数（num_iterations）だけ反復してツリーを追加します。
+// 各反復で1つ（または複数クラスの場合は複数）の決定木を学習します。
 void GBDT::Train(int snapshot_freq, const std::string& model_output_path) {
   Common::FunctionTimer fun_timer("GBDT::Train", global_timer);
   bool is_finished = false;
   auto start_time = std::chrono::steady_clock::now();
+  
+  // 【メインループ】指定された回数だけ反復
   for (int iter = 0; iter < config_->num_iterations && !is_finished; ++iter) {
+    // 【ステップ1】1回の反復でツリーを1本（または複数）学習
+    // TrainOneIter()の中で以下が実行されます：
+    //   - 勾配とヘッシアンを計算（目的関数から）
+    //   - データサンプリング（GOSS、バギングなど）
+    //   - 決定木を学習
+    //   - スコアを更新
     is_finished = TrainOneIter(nullptr, nullptr);
+    
+    // 【ステップ2】評価指標を計算し、早期停止をチェック
     if (!is_finished) {
       is_finished = EvalAndCheckEarlyStopping();
     }
+    
+    // 【ステップ3】経過時間をログ出力
     auto end_time = std::chrono::steady_clock::now();
-    // output used time per iteration
     Log::Info("%f seconds elapsed, finished iteration %d", std::chrono::duration<double,
               std::milli>(end_time - start_time) * 1e-3, iter + 1);
+    
+    // 【ステップ4】スナップショットを保存（定期的にモデルを保存）
     if (snapshot_freq > 0
         && (iter + 1) % snapshot_freq == 0) {
       std::string snapshot_out = model_output_path + ".snapshot_iter_" + std::to_string(iter + 1);
@@ -349,23 +411,71 @@ double GBDT::BoostFromAverage(int class_id, bool update_scorer) {
   return 0.0f;
 }
 
+// ============================================================================
+// GBDT::TrainOneIter：1回の反復でツリーを1本学習する
+// ============================================================================
+// 
+// 【勾配ブースティングの全体の流れ】
+// 
+// このメソッドは、勾配ブースティングの1回の反復を実行します。
+// 各反復で、以下のステップを実行します：
+// 
+// 【ステップ1】勾配とヘッシアンの計算
+//   - 現在の予測値（score）と正解ラベル（label）から、損失関数の勾配とヘッシアンを計算
+//   - 例（回帰）：勾配 = score - label, ヘッシアン = 1.0
+// 
+// 【ステップ2】データサンプリング（GOSS、バギングなど）
+//   - 大きな勾配を持つサンプルを優先的に選択（GOSS）
+//   - または、ランダムにサンプルを選択（バギング）
+// 
+// 【ステップ3】決定木を学習
+//   - 勾配とヘッシアンを使って、損失を最小化する決定木を学習
+//   - リーフの出力値 = -sum_gradients / (sum_hessians + lambda_l2)
+//   - リーフワイズ成長：ゲインが最大のリーフを優先的に分割
+// 
+// 【ステップ4】スコアを更新
+//   - 予測値を更新：score[i] += learning_rate * tree_output[i]
+//   - これにより、予測値が段階的に改善されていきます
+// 
+// 【出力値（output value）とは？】
+// 
+// 出力値は、決定木のリーフが予測する値です。
+// MAPEなどの目的変数（正解ラベル）ではなく、予測値そのものです。
+// 
+// 勾配ブースティングの予測の流れ：
+//   1. 初期予測値から開始（例：平均値、または0）
+//   2. 各ツリーのリーフの出力値を累積：score += learning_rate * tree_output
+//   3. 最終的な予測値 = 初期予測値 + すべてのツリーの出力値の合計
+// 
+// 例：回帰タスクの場合
+//   - 初期予測値 = 10.0（平均値）
+//   - ツリー1のリーフの出力値 = +2.5
+//   - ツリー2のリーフの出力値 = -1.3
+//   - ツリー3のリーフの出力値 = +0.8
+//   - 最終予測値 = 10.0 + 0.1*(2.5 - 1.3 + 0.8) = 10.2（learning_rate=0.1の場合）
+// 
+// つまり、出力値は「現在の予測値をどれだけ修正するか」を表す値です。
 bool GBDT::TrainOneIter(const score_t* gradients, const score_t* hessians) {
   Common::FunctionTimer fun_timer("GBDT::TrainOneIter", global_timer);
   std::vector<double> init_scores(num_tree_per_iteration_, 0.0);
-  // boosting first
+  
+  // 【ステップ1】勾配とヘッシアンの計算
   if (gradients == nullptr || hessians == nullptr) {
+    // 通常の目的関数を使用する場合
+    // 初期スコアを計算（平均値から開始する場合）
     for (int cur_tree_id = 0; cur_tree_id < num_tree_per_iteration_; ++cur_tree_id) {
       init_scores[cur_tree_id] = BoostFromAverage(cur_tree_id, true);
     }
+    // Boosting()メソッドで勾配とヘッシアンを計算
+    // 目的関数のGetGradients()とGetHessians()が呼ばれます
     Boosting();
     gradients = gradients_pointer_;
     hessians = hessians_pointer_;
   } else {
-    // use customized objective function
-    // the check below fails unless objective=custom is provided in the parameters on Booster creation
+    // カスタム目的関数を使用する場合（Pythonから直接勾配を渡す場合）
     CHECK(objective_function_ == nullptr);
     if (data_sample_strategy_->IsHessianChange()) {
-      // need to copy customized gradients when using GOSS
+      // GOSSを使用する場合、勾配とヘッシアンをコピーする必要がある
       int64_t total_size = static_cast<int64_t>(num_data_) * num_tree_per_iteration_;
       #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static)
       for (int64_t i = 0; i < total_size; ++i) {
@@ -379,26 +489,38 @@ bool GBDT::TrainOneIter(const score_t* gradients, const score_t* hessians) {
     }
   }
 
-  // bagging logic
+  // 【ステップ2】データサンプリング（バギング、GOSSなど）
+  // クエリ単位のバギングでない場合のみ実行
   if (!config_->bagging_by_query) {
+    // Bagging()メソッドで以下が実行されます：
+    //   - GOSS: 大きな勾配を持つサンプルを優先的に選択
+    //   - バギング: ランダムにサンプルを選択
+    //   - サブセット作成: サンプリングされたデータのみを使用
     data_sample_strategy_->Bagging(iter_, tree_learner_.get(), gradients_.data(), hessians_.data());
   }
+  // 【ステップ3】サンプリング結果を取得
   const bool is_use_subset = data_sample_strategy_->is_use_subset();
   const data_size_t bag_data_cnt = data_sample_strategy_->bag_data_cnt();
   const std::vector<data_size_t, Common::AlignmentAllocator<data_size_t, kAlignedSize>>& bag_data_indices = data_sample_strategy_->bag_data_indices();
 
+  // 【ステップ4】勾配バッファをリセット（必要に応じて）
   if (objective_function_ == nullptr && is_use_subset && bag_data_cnt < num_data_ && !boosting_on_gpu_ && !data_sample_strategy_->IsHessianChange()) {
     ResetGradientBuffers();
   }
 
+  // 【ステップ5】各クラス（または各ツリー）ごとに決定木を学習
+  // 多クラス分類の場合、クラスごとに1本のツリーを学習します
   bool should_continue = false;
   for (int cur_tree_id = 0; cur_tree_id < num_tree_per_iteration_; ++cur_tree_id) {
     const size_t offset = static_cast<size_t>(cur_tree_id) * num_data_;
     std::unique_ptr<Tree> new_tree(new Tree(2, false, false));
+    
     if (class_need_train_[cur_tree_id] && train_data_->num_features() > 0) {
+      // このクラス用の勾配とヘッシアンを取得
       auto grad = gradients + offset;
       auto hess = hessians + offset;
-      // need to copy gradients for bagging subset.
+      
+      // サブセットを使用する場合、勾配とヘッシアンをコピー
       if (is_use_subset && bag_data_cnt < num_data_ && !boosting_on_gpu_) {
         for (int i = 0; i < bag_data_cnt; ++i) {
           gradients_pointer_[offset + i] = grad[bag_data_indices[i]];
@@ -407,20 +529,49 @@ bool GBDT::TrainOneIter(const score_t* gradients, const score_t* hessians) {
         grad = gradients_pointer_ + offset;
         hess = hessians_pointer_ + offset;
       }
+      
+      // 【ステップ6】決定木を学習
+      // tree_learner_->Train()の中で以下が実行されます：
+      //   - ヒストグラムを構築
+      //   - 最適な分割点を探索
+      //   - リーフワイズにツリーを成長させる
       bool is_first_tree = models_.size() < static_cast<size_t>(num_tree_per_iteration_);
       new_tree.reset(tree_learner_->Train(grad, hess, is_first_tree));
     }
 
+    // 【ステップ7】学習したツリーの処理
     if (new_tree->num_leaves() > 1) {
+      // ツリーが正常に学習された場合
       should_continue = true;
       auto score_ptr = train_score_updater_->score() + offset;
+      
+      // リジデュアル（残差）を計算する関数を定義
       auto residual_getter = [score_ptr](const label_t* label, int i) {return static_cast<double>(label[i]) - score_ptr[i]; };
+      
+      // ツリーのリーフの出力値を更新（目的関数に応じて最適化）
       tree_learner_->RenewTreeOutput(new_tree.get(), objective_function_, residual_getter,
                                      num_data_, bag_data_indices.data(), bag_data_cnt, train_score_updater_->score());
-      // shrinkage by learning rate
+      
+      // 【ステップ8】学習率（shrinkage）を適用
+      // 勾配ブースティングでは、各ツリーの出力を学習率で縮小します
+      // これにより、過学習を防ぎ、より安定した学習が可能になります
       new_tree->Shrinkage(shrinkage_rate_);
-      // update score
+      
+      // 【ステップ9】スコアを更新
+      // 
+      // 勾配ブースティングの予測値の更新：
+      //   score[i] += learning_rate * tree_output[i]
+      // 
+      // ここで：
+      //   - score[i]: サンプルiの現在の予測値
+      //   - learning_rate: 学習率（通常0.1など、小さな値）
+      //   - tree_output[i]: サンプルiが該当するリーフの出力値
+      // 
+      // この更新により、予測値が段階的に改善されていきます。
+      // 訓練データと検証データの両方のスコアを更新します
       UpdateScore(new_tree.get(), cur_tree_id);
+      
+      // 【ステップ10】初期スコアを追加（必要な場合）
       if (std::fabs(init_scores[cur_tree_id]) > kEpsilon) {
         new_tree->AddBias(init_scores[cur_tree_id]);
       }

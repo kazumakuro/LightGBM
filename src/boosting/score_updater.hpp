@@ -73,9 +73,23 @@ class ScoreUpdater {
   * \param tree Trained tree model
   * \param cur_tree_id Current tree for multiclass training
   */
+  // ============================================================================
+  // AddScore：ツリーの出力値をスコアに加算
+  // ============================================================================
+  // 
+  // 勾配ブースティングでは、各ツリーのリーフの出力値を予測値に累積します。
+  // 
+  // 処理の流れ：
+  //   1. 各サンプルについて、ツリーでどのリーフに該当するかを判定
+  //   2. そのリーフの出力値を取得
+  //   3. 現在の予測値（score）に加算：score[i] += tree_output
+  // 
+  // これにより、予測値が段階的に改善されていきます。
   virtual inline void AddScore(const Tree* tree, int cur_tree_id) {
     Common::FunctionTimer fun_timer("ScoreUpdater::AddScore", global_timer);
     const size_t offset = static_cast<size_t>(num_data_) * cur_tree_id;
+    // ツリーの予測値をスコアに加算
+    // 各サンプルについて、該当するリーフの出力値をscoreに加算します
     tree->AddPredictionToScore(data_, num_data_, score_.data() + offset);
   }
   /*!

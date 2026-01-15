@@ -179,10 +179,22 @@ void SerialTreeLearner::ResetConfig(const Config* config) {
   constraints_.reset(LeafConstraintsBase::Create(config_, config_->num_leaves, train_data_->num_features()));
 }
 
+// ============================================================================
+// SerialTreeLearner::Train：1本の決定木を学習する
+// ============================================================================
+// このメソッドは、勾配とヘッシアンを受け取り、1本の決定木を学習します。
+// LightGBMの核心となる処理で、以下の最適化が行われます：
+//   - ヒストグラムベースの学習（ビン化による高速化）
+//   - リーフワイズ成長（ゲインが最大のリーフを優先的に分割）
+//   - ヒストグラム減算（親のヒストグラムから子のヒストグラムを計算）
 Tree* SerialTreeLearner::Train(const score_t* gradients, const score_t *hessians, bool /*is_first_tree*/) {
   Common::FunctionTimer fun_timer("SerialTreeLearner::Train", global_timer);
+  
+  // 【ステップ1】勾配とヘッシアンを保存
   gradients_ = gradients;
   hessians_ = hessians;
+  
+  // 【ステップ2】スレッド数のチェック
   int num_threads = OMP_NUM_THREADS();
   if (share_state_->num_threads != num_threads && share_state_->num_threads > 0) {
     Log::Warning(
@@ -192,57 +204,85 @@ Tree* SerialTreeLearner::Train(const score_t* gradients, const score_t *hessians
   }
   share_state_->num_threads = num_threads;
 
+  // 【ステップ3】勾配の量子化（メモリ効率化のため）
   if (config_->use_quantized_grad) {
     gradient_discretizer_->DiscretizeGradients(num_data_, gradients_, hessians_);
   }
 
-  // some initial works before training
+  // 【ステップ4】訓練前の初期化処理
   BeforeTrain();
 
+  // 【ステップ5】新しいツリーオブジェクトを作成
   bool track_branch_features = !(config_->interaction_constraints_vector.empty());
   auto tree = std::unique_ptr<Tree>(new Tree(config_->num_leaves, track_branch_features, false));
   auto tree_ptr = tree.get();
   constraints_->ShareTreePointer(tree_ptr);
 
-  // set the root value by hand, as it is not handled by splits
+  // 【ステップ6】ルートノードの出力値を設定
+  // ルートノードは分割されないので、手動で出力値を設定します
+  // 出力値は、勾配とヘッシアンの合計から計算されます
   tree->SetLeafOutput(0, FeatureHistogram::CalculateSplittedLeafOutput<true, true, true, false>(
     smaller_leaf_splits_->sum_gradients(), smaller_leaf_splits_->sum_hessians(),
     config_->lambda_l1, config_->lambda_l2, config_->max_delta_step,
     BasicConstraint(), config_->path_smooth, static_cast<data_size_t>(num_data_), 0));
 
-  // root leaf
-  int left_leaf = 0;
-  int cur_depth = 1;
-  // only root leaf can be splitted on first time
-  int right_leaf = -1;
+  // 【ステップ7】ルートリーフの初期化
+  int left_leaf = 0;      // 左の子リーフ（最初はルート）
+  int cur_depth = 1;      // 現在の深さ
+  int right_leaf = -1;    // 右の子リーフ（最初は存在しない）
 
+  // 【ステップ8】強制分割（forced splits）を適用
   int init_splits = ForceSplits(tree_ptr, &left_leaf, &right_leaf, &cur_depth);
 
+  // 【ステップ9】リーフワイズ成長のメインループ
+  // num_leaves - 1回だけ分割を行います（リーフ数がnum_leavesになるまで）
   for (int split = init_splits; split < config_->num_leaves - 1; ++split) {
-    // some initial works before finding best split
+    // 【ステップ9-1】分割前の準備処理
+    // ヒストグラムの構築準備などを行います
     if (BeforeFindBestSplit(tree_ptr, left_leaf, right_leaf)) {
-      // find best threshold for every feature
+      // 【ステップ9-2】各特徴量について最適な分割点を探索
+      // FindBestSplits()の中で以下が実行されます：
+      //   - ヒストグラムを構築（または親から減算）
+      //   - 各ビンで分割した場合のゲインを計算
+      //   - 最大ゲインを持つ分割点を見つける
       FindBestSplits(tree_ptr);
     }
-    // Get a leaf with max split gain
+    
+    // 【ステップ9-3】最大ゲインを持つリーフを選択（リーフワイズ成長の核心）
+    // 
+    // ゲイン（gain）とは：
+    //   - 「分割することでどれだけ損失が減るか」を表す指標
+    //   - ゲイン = 分割前の損失 - (分割後の左リーフの損失 + 分割後の右リーフの損失)
+    //   - ゲインが大きい = 損失を大きく減らせる = 分割の価値が高い
+    //
+    // リーフワイズ成長：
+    //   - レベルワイズ（同じ深さの全リーフを分割）ではなく、
+    //   - ゲインが最大のリーフを優先的に分割する
+    //   - これにより、同じリーフ数でもより低い損失を達成できる
     int best_leaf = static_cast<int>(ArrayArgs<SplitInfo>::ArgMax(best_split_per_leaf_));
-    // Get split information for best leaf
     const SplitInfo& best_leaf_SplitInfo = best_split_per_leaf_[best_leaf];
-    // cannot split, quit
+    
+    // 【ステップ9-4】ゲインが0以下の場合は分割を停止
+    // ゲインが0以下 = 分割しても損失が減らない（むしろ増える可能性がある）
+    // この場合、分割を停止してツリーの成長を終了する
     if (best_leaf_SplitInfo.gain <= 0.0) {
       Log::Warning("No further splits with positive gain, best gain: %f", best_leaf_SplitInfo.gain);
       break;
     }
-    // split tree with best leaf
+    
+    // 【ステップ9-5】選択したリーフを分割
+    // このリーフを2つの子リーフに分割し、データを振り分けます
     Split(tree_ptr, best_leaf, &left_leaf, &right_leaf);
     cur_depth = std::max(cur_depth, tree->leaf_depth(left_leaf));
   }
 
+  // 【ステップ10】量子化勾配を使用している場合、リーフの出力値を更新
   if (config_->use_quantized_grad && config_->quant_train_renew_leaf) {
     gradient_discretizer_->RenewIntGradTreeOutput(tree.get(), config_, data_partition_.get(), gradients_, hessians_,
       [this] (int leaf_index) { return GetGlobalDataCountInLeaf(leaf_index); });
   }
 
+  // 【ステップ11】学習完了
   Log::Debug("Trained a tree with leaves = %d and depth = %d", tree->num_leaves(), cur_depth);
   return tree.release();
 }
@@ -390,11 +430,23 @@ void SerialTreeLearner::FindBestSplits(const Tree* tree) {
   FindBestSplits(tree, nullptr);
 }
 
+// ============================================================================
+// FindBestSplits：各特徴量について最適な分割点を探索
+// ============================================================================
+// このメソッドは、LightGBMの核心となる処理です：
+//   1. 使用する特徴量を決定（特徴量サンプリング）
+//   2. ヒストグラムを構築（または親から減算）
+//   3. 各特徴量の各ビンで分割した場合のゲインを計算
+//   4. 最大ゲインを持つ分割点を見つける
 void SerialTreeLearner::FindBestSplits(const Tree* tree, const std::set<int>* force_features) {
+  // 【ステップ1】使用する特徴量を決定
+  // 特徴量サンプリング（feature_fraction）が有効な場合、一部の特徴量のみを使用
   std::vector<int8_t> is_feature_used(num_features_, 0);
   #pragma omp parallel for num_threads(OMP_NUM_THREADS()) schedule(static, 256) if (num_features_ >= 512)
   for (int feature_index = 0; feature_index < num_features_; ++feature_index) {
+    // この特徴量が使用されない場合、スキップ
     if (!col_sampler_.is_feature_used_bytree()[feature_index] && (force_features == nullptr || force_features->find(feature_index) == force_features->end())) continue;
+    // 親ノードで分割不可能な特徴量は、子ノードでも分割不可能
     if (parent_leaf_histogram_array_ != nullptr
         && !parent_leaf_histogram_array_[feature_index].is_splittable()) {
       smaller_leaf_histogram_array_[feature_index].set_is_splittable(false);
@@ -402,17 +454,36 @@ void SerialTreeLearner::FindBestSplits(const Tree* tree, const std::set<int>* fo
     }
     is_feature_used[feature_index] = 1;
   }
+  
+  // 【ステップ2】ヒストグラム減算を使用するかどうかを決定
+  // 親ノードのヒストグラムが存在する場合、減算を使用して高速化
   bool use_subtract = parent_leaf_histogram_array_ != nullptr;
 
+  // 【ステップ3】ヒストグラムを構築
+  // 小さい方のリーフのヒストグラムを構築し、
+  // 大きい方のリーフのヒストグラムは親から減算で計算
   ConstructHistograms(is_feature_used, use_subtract);
+  
+  // 【ステップ4】ヒストグラムから最適な分割点を探索
+  // 各特徴量の各ビンで分割した場合のゲインを計算し、最大ゲインを見つける
   FindBestSplitsFromHistograms(is_feature_used, use_subtract, tree);
 }
 
+// ============================================================================
+// ConstructHistograms：ヒストグラムを構築
+// ============================================================================
+// このメソッドは、特徴量のヒストグラムを構築します。
+// ヒストグラムは、各ビンに含まれるサンプルの勾配とヘッシアンの合計を保持します。
+// 
+// 最適化：
+//   - use_subtract=trueの場合、小さい方のリーフのヒストグラムを構築し、
+//     大きい方のリーフのヒストグラムは親から減算で計算（高速化）
+//   - use_subtract=falseの場合、両方のリーフのヒストグラムを構築
 void SerialTreeLearner::ConstructHistograms(
     const std::vector<int8_t>& is_feature_used, bool use_subtract) {
   Common::FunctionTimer fun_timer("SerialTreeLearner::ConstructHistograms",
                                   global_timer);
-  // construct smaller leaf
+  // 【ステップ1】小さい方のリーフのヒストグラムを構築
   if (config_->use_quantized_grad) {
     const uint8_t smaller_leaf_num_bits = gradient_discretizer_->GetHistBitsInLeaf<false>(smaller_leaf_splits_->leaf_index());
     hist_t* ptr_smaller_leaf_hist_data =
